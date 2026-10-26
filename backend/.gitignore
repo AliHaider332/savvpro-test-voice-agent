@@ -1,0 +1,21 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# node
+node_modules/
+.next/
+out/
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/

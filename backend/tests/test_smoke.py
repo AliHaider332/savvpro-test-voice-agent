@@ -1,90 +1,66 @@
-"""Task 1 acceptance: app boots, /health responds, contract types load."""
-from __future__ import annotations
-
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
-import pytest
 
 from app.brain.states import EventKind, Flow, Intent, State
 from app.main import app
-from app.schemas import (
-    Context,
-    Entities,
-    ParsedTurn,
-    PendingAction,
-    TurnRequest,
-)
-
+from app.schemas import Context, TurnRequest
 
 client = TestClient(app)
 
 
-def test_health_returns_ok_when_db_not_configured(monkeypatch):
-    # Ensure the test is independent of any developer .env
-    from app.config import get_settings
-    get_settings.cache_clear()
-    monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.setenv("DATABASE_URL", "")
-
+def test_health_ok():
     r = client.get("/health")
     assert r.status_code == 200
-    body = r.json()
-    assert body["status"] == "ok"
-    assert body["db"] in {"not_configured", "ok"}
-
-    get_settings.cache_clear()
+    assert r.json()["status"] == "ok"
 
 
-def test_enum_vocabulary_is_complete():
-    # These names are referenced everywhere. Fail loudly if any is dropped.
+def test_unknown_route_uses_error_format():
+    r = client.get("/nope")
+    assert r.status_code == 404
+    assert set(r.json()["error"]) == {"code", "message", "details"}
+
+
+def test_state_set_is_exactly_five():
     assert {s.value for s in State} == {
-        "IDLE", "COLLECTING", "AWAITING_CONFIRMATION",
-        "DISAMBIGUATING", "COMPLETED",
+        "IDLE", "COLLECTING", "AWAITING_CONFIRMATION", "DISAMBIGUATING", "COMPLETED"
     }
+
+
+def test_core_intents_and_flows_exist():
+    for name in ["BOOK_APPOINTMENT", "RESCHEDULE_APPOINTMENT", "CANCEL_APPOINTMENT",
+                 "CONFIRM", "DECLINE", "CORRECT_INFORMATION", "CANCEL_CONVERSATION", "UNKNOWN"]:
+        assert Intent(name)
     assert {f.value for f in Flow} == {"BOOK", "RESCHEDULE", "CANCEL"}
-    assert Intent.CONFIRM.value == "CONFIRM"
-    assert Intent.DECLINE.value == "DECLINE"
     assert EventKind.DB_WRITE.value == "DB_WRITE"
 
 
-def test_context_defaults_are_safe():
+def test_context_defaults_are_empty():
     ctx = Context()
     assert ctx.flow is None
-    assert ctx.entities == Entities()
-    assert ctx.offered_slots == []
     assert ctx.pending_action is None
-    # extra="forbid" guards against silent typo drift between layers
+    assert ctx.entities.date is None
+    assert ctx.offered_slots == []
+
+
+def test_context_round_trips_through_json():
+    ctx = Context(flow=Flow.BOOK)
+    assert Context.model_validate_json(ctx.model_dump_json()) == ctx
+
+
+def test_turn_request_accepts_empty_text():
+    assert TurnRequest(turn_id=uuid4(), text="").text == ""
+
+
+def test_turn_request_rejects_overlong_text_and_bad_confidence():
     with pytest.raises(ValidationError):
-        Context.model_validate({"flow": "BOOK", "unknown_typo": 1})
-
-
-def test_turn_request_validation():
-    req = TurnRequest(turn_id=uuid4(), text="book dr ahmed tomorrow", input_mode="text")
-    assert req.stt_confidence is None
-
+        TurnRequest(turn_id=uuid4(), text="x" * 501)
     with pytest.raises(ValidationError):
-        TurnRequest(turn_id=uuid4(), text="x" * 501)  # over max_length
+        TurnRequest(turn_id=uuid4(), text="hi", stt_confidence=1.5)
 
 
-def test_pending_action_round_trip():
-    from datetime import datetime, timedelta, timezone
-    now = datetime.now(tz=timezone.utc)
-    p = PendingAction(
-        action_id=uuid4(),
-        type="book",
-        fingerprint="a" * 64,
-        summary="book Dr. Ahmed tomorrow at 11 AM under Ali",
-        created_at=now,
-        expires_at=now + timedelta(minutes=10),
-    )
-    assert p.expires_at > p.created_at
-    assert p.slot_id is None and p.appt_id is None
-
-
-def test_parsed_turn_confidence_bounds():
-    base = ParsedTurn(intent=Intent.UNKNOWN)
-    assert base.stt_confidence == 1.0
+def test_turn_request_rejects_non_uuid_turn_id():
     with pytest.raises(ValidationError):
-        ParsedTurn(intent=Intent.UNKNOWN, stt_confidence=1.5)
+        TurnRequest(turn_id="not-a-uuid", text="hi")

@@ -1,30 +1,21 @@
-"""Application settings loaded from environment / .env."""
-from __future__ import annotations
-
 from functools import lru_cache
 
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """All runtime configuration. Reads from environment, then backend/.env."""
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
+    database_url: str | None = None
+    database_url_test: str | None = None
+    clinic_timezone: str = "Asia/Karachi"
+    allowed_origins: str = "http://localhost:3000"
 
-    database_url: str = Field(
-        default="",
-        description="SQLAlchemy URL, e.g. postgresql+psycopg://user:pass@host:5432/db",
-    )
-    database_url_test: str = Field(default="")
-    clinic_timezone: str = Field(default="Asia/Karachi")
+    @property
+    def origins_list(self) -> list[str]:
+        return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
 
 
-@lru_cache(maxsize=1)
+@lru_cache
 def get_settings() -> Settings:
-    """Cached singleton so settings are parsed once per process."""
     return Settings()
