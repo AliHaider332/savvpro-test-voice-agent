@@ -1,7 +1,5 @@
-# STATUS
-Done: Task 1 scaffold (9 smoke tests pass) · Task 2 datetime parser (pending your test run)
-Tests: smoke 9 passing; datetime: <paste result>
-Known bugs: none yet
-Decisions: weekday = strictly-after-today; "next X" = next calendar week; 5/3 ambiguous;
-           bare numbers only with trigger/am-pm/o'clock or bare_ok=True
-NEXT TASK: Task 3 — brain/parser.py (intent + entity extraction) and test_parser.py
+Done: Task 1 scaffold · Task 2 datetime parser (122 tests passing) · Task 3 parser.py (pending test run)
+Tests: smoke 9 + datetime 113 passing; parser: <paste result>
+Decisions: parser is state-agnostic except DISAMBIGUATING; expected_field drives bare answers;
+           medical/unsupported checked before flow intents; confirm needs pure yes-words
+NEXT TASK: Task 4 — engine (brain/engine.py, memory_repo, appointments service) for the booking flow
