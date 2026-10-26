@@ -36,6 +36,7 @@ class Intent(str, Enum):
 
 
 class EventKind(str, Enum):
+    NO_ACTION = "NO_ACTION"
     TURN_RECEIVED = "TURN_RECEIVED"
     PARSED = "PARSED"
     EMPTY_INPUT = "EMPTY_INPUT"
