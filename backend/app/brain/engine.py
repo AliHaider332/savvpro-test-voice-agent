@@ -1,9 +1,10 @@
-"""Deterministic conversation engine (booking flow).
+"""Deterministic conversation engine (book / reschedule / cancel).
 
 Rules that must always hold:
-  * The ONLY call that mutates the database is Engine._execute -> service.book.
-  * _execute runs only after authorize() returns ok.
-  * Any change to doctor/date/time/name clears the pending action.
+  * The ONLY method that mutates the database is Engine._execute (through the
+    private _execute_book / _execute_reschedule / _execute_cancel helpers).
+  * _execute runs only after authorize() returns ok, via _confirm.
+  * Any change to a field that defines the action clears the pending action.
 """
 from __future__ import annotations
 
@@ -28,9 +29,25 @@ from app.services.appointments import AppointmentService, BookingError
 
 CONFIRMATION_TTL = timedelta(minutes=10)
 HINT_AFTER_RETRIES = 3
-_SLOT_FIELDS = {"doctor_slug", "date", "time"}
+
+_SLOT_FIELDS = {"doctor_slug", "date", "time", "new_date", "new_time"}
+_LOOKUP_FIELDS = {"booking_reference", "verify_name"}
+_ENTITY_FIELDS = ("doctor_slug", "date", "time", "time_period", "patient_name",
+                  "booking_reference", "verify_name", "new_date", "new_time")
+
+# (entity attribute, label used in missing_fields / expected_field)
 _BOOK_FIELDS = (("doctor_slug", "doctor"), ("date", "date"),
                 ("time", "time"), ("patient_name", "patient_name"))
+_LOOKUP = (("booking_reference", "booking_reference"), ("verify_name", "verify_name"))
+_MOVE_TARGET = (("new_date", "new_date"), ("new_time", "new_time"))
+
+_APPT_FLOWS = (Flow.RESCHEDULE, Flow.CANCEL)
+_ACTIVITY = {Flow.BOOK: "booking", Flow.RESCHEDULE: "rescheduling", Flow.CANCEL: "cancellation"}
+_ALLOWED = {
+    Flow.BOOK: {"doctor_slug", "doctor_name", "date", "time", "time_period", "patient_name"},
+    Flow.RESCHEDULE: {"booking_reference", "verify_name", "new_date", "new_time", "time_period"},
+    Flow.CANCEL: {"booking_reference", "verify_name"},
+}
 Clock = Callable[[], datetime]
 
 
@@ -59,10 +76,17 @@ class _Trace:
 
 # ----------------------------------------------------------------- pure helpers
 
+def _required_fields(ctx: Context):
+    if ctx.flow == Flow.BOOK:
+        return _BOOK_FIELDS
+    if ctx.flow in _APPT_FLOWS:
+        base = () if ctx.appointment_snapshot else _LOOKUP
+        return (*base, *(_MOVE_TARGET if ctx.flow == Flow.RESCHEDULE else ()))
+    return ()
+
+
 def missing_fields(ctx: Context) -> list[str]:
-    if ctx.flow != Flow.BOOK:
-        return []
-    return [label for attr, label in _BOOK_FIELDS if getattr(ctx.entities, attr) is None]
+    return [label for attr, label in _required_fields(ctx) if getattr(ctx.entities, attr) is None]
 
 
 def fingerprint(ctx: Context) -> str:
@@ -91,7 +115,18 @@ def authorize(session: Session, parsed: ParsedTurn, now: datetime) -> tuple[bool
         return False, "stale_fingerprint"
     if now - pa.created_at > CONFIRMATION_TTL:
         return False, "expired"
-    if missing_fields(ctx) or ctx.selected_slot_id is None or ctx.selected_slot_id != pa.slot_id:
+    if ctx.flow is None or missing_fields(ctx):
+        return False, "missing_fields"
+    if ctx.flow == Flow.BOOK:
+        if ctx.selected_slot_id is None or ctx.selected_slot_id != pa.slot_id:
+            return False, "missing_fields"
+        return True, "ok"
+    snap = ctx.appointment_snapshot
+    if (snap is None or snap.status != "confirmed" or pa.appointment_id != snap.id
+            or pa.appointment_version != snap.version):
+        return False, "appointment_mismatch"
+    if ctx.flow == Flow.RESCHEDULE and (
+            ctx.selected_slot_id is None or ctx.selected_slot_id != pa.slot_id):
         return False, "missing_fields"
     return True, "ok"
 
@@ -148,7 +183,7 @@ class Engine:
         if i == Intent.DECLINE:
             return self._decline(s, tr)
         if i in (Intent.CANCEL_APPOINTMENT, Intent.RESCHEDULE_APPOINTMENT):
-            return self._other_flow(s, p, tr)
+            return self._other_flow(s, p, now, today, tr)
         if i in (Intent.BOOK_APPOINTMENT, Intent.PROVIDE_INFORMATION,
                  Intent.CORRECT_INFORMATION, Intent.SELECT_OPTION):
             return self._collect(s, p, now, today, tr)
@@ -168,36 +203,58 @@ class Engine:
     def _decline(self, s: Session, tr: _Trace) -> _Out:
         ctx = s.context
         if s.state == State.AWAITING_CONFIRMATION and ctx.pending_action:
+            flow = ctx.pending_action.type
             tr.add(K.CONFIRMATION_DECLINED, executed=False,
                    action_id=str(ctx.pending_action.action_id))
             ctx.pending_action = None
+            if flow == Flow.CANCEL:
+                self._reset(s, tr, "cancellation_declined")
+                return _Out(R.cancel_declined())
             self._move(s, State.COLLECTING, tr, "confirmation_declined")
-            return _Out(R.declined())
+            return _Out(R.reschedule_declined() if flow == Flow.RESCHEDULE else R.declined())
         tr.add(K.NO_ACTION, reason="decline_without_pending")
         return _Out(f"Okay. {self._prompt(s)}")
 
-    def _other_flow(self, s: Session, p: ParsedTurn, tr: _Trace) -> _Out:
-        """Reschedule / cancel-appointment: implemented in Task 5. Only the
-        'bare cancel mid-booking' disambiguation exists now."""
+    # ---- reschedule / cancel entry
+    def _other_flow(self, s: Session, p: ParsedTurn, now: datetime, today: date,
+                    tr: _Trace) -> _Out:
         ctx = s.context
-        if (p.intent == Intent.CANCEL_APPOINTMENT and p.bare_cancel and ctx.flow
+        # bare "cancel" while booking/rescheduling: stop the request, or cancel an appointment?
+        if (p.intent == Intent.CANCEL_APPOINTMENT and p.bare_cancel
+                and ctx.flow in (Flow.BOOK, Flow.RESCHEDULE)
                 and s.state in (State.COLLECTING, State.AWAITING_CONFIRMATION)):
             if ctx.pending_action:
                 ctx.pending_action = None
                 tr.add(K.STALE_PENDING_CLEARED, reason="ambiguous_cancel")
             self._move(s, State.DISAMBIGUATING, tr, "bare_cancel_mid_flow")
-            return _Out(R.disambiguate())
-        tr.add(K.UNSUPPORTED_REQUEST, reason="not_implemented_in_this_build", intent=p.intent.value)
-        if s.state == State.DISAMBIGUATING:
-            self._reset(s, tr, "disambiguation_resolved")
-        return _Out(f"{R.not_implemented()} {self._prompt(s)}")
+            return _Out(R.disambiguate(_ACTIVITY[ctx.flow]))
+        target = Flow.RESCHEDULE if p.intent == Intent.RESCHEDULE_APPOINTMENT else Flow.CANCEL
+        self._enter_flow(s, target, tr)
+        return self._collect(s, p, now, today, tr)
+
+    def _enter_flow(self, s: Session, target: Flow, tr: _Trace) -> None:
+        """Start a flow or switch to another one. A switch drops the old pending action;
+        switching between reschedule and cancel keeps the verified appointment."""
+        old = s.context
+        if old.flow == target:
+            return
+        if old.flow is not None:
+            tr.add(K.INTENT_SWITCH, from_flow=old.flow.value, to_flow=target.value)
+            if old.pending_action:
+                tr.add(K.STALE_PENDING_CLEARED, reason="intent_switch")
+        new = Context(flow=target, last_completed=old.last_completed)
+        if old.flow in _APPT_FLOWS and target in _APPT_FLOWS:
+            new.entities = Entities(booking_reference=old.entities.booking_reference,
+                                    verify_name=old.entities.verify_name)
+            new.appointment_snapshot = old.appointment_snapshot
+        s.context = new
 
     # ---- confirmation gate
     def _confirm(self, s: Session, p: ParsedTurn, now: datetime, today: date, tr: _Trace) -> _Out:
         ok, reason = authorize(s, p, now)
         if not ok:
             tr.add(K.REFUSED, executed=False, reason=reason)
-            if reason in ("stale_fingerprint", "expired", "missing_fields"):
+            if reason in ("stale_fingerprint", "expired", "missing_fields", "appointment_mismatch"):
                 tr.add(K.STALE_PENDING_CLEARED, reason=reason)
                 s.context.pending_action = None
                 lead = R.expired() if reason == "expired" else R.stale_confirmation()
@@ -210,6 +267,15 @@ class Engine:
 
     def _execute(self, s: Session, now: datetime, today: date, tr: _Trace) -> _Out:
         """The single mutation point. Reached only through _confirm after authorize()."""
+        pa = s.context.pending_action
+        assert pa is not None
+        if pa.type == Flow.RESCHEDULE:
+            return self._execute_reschedule(s, now, today, tr)
+        if pa.type == Flow.CANCEL:
+            return self._execute_cancel(s, now, today, tr)
+        return self._execute_book(s, now, today, tr)
+
+    def _execute_book(self, s: Session, now: datetime, today: date, tr: _Trace) -> _Out:
         ctx = s.context
         pa, e = ctx.pending_action, ctx.entities
         assert pa is not None and ctx.selected_slot_id is not None and e.patient_name
@@ -238,12 +304,99 @@ class Engine:
                                               booking_reference=appt.booking_reference,
                                               appointment=appt))
 
+    def _execute_reschedule(self, s: Session, now: datetime, today: date, tr: _Trace) -> _Out:
+        ctx = s.context
+        pa, snap = ctx.pending_action, ctx.appointment_snapshot
+        assert pa is not None and snap is not None and ctx.selected_slot_id is not None
+        try:
+            appt = self._svc.reschedule(appointment=snap, new_slot_id=ctx.selected_slot_id, now=now)
+        except BookingError as err:
+            return self._write_failed(s, err, now, today, tr)
+        tr.add(K.DB_WRITE, executed=True, type=Flow.RESCHEDULE.value,
+               booking_reference=appt.booking_reference, appointment_id=str(appt.id),
+               slot_id=str(appt.slot_id), version=appt.version)
+        ctx.pending_action = None
+        ctx.offered_slots = []
+        ctx.appointment_snapshot = appt
+        self._move(s, State.COMPLETED, tr, "action_executed")
+        local = appt.starts_at.astimezone(self._svc.tz)
+        return _Out(R.rescheduled(appt.booking_reference, appt.doctor_name,
+                                  R.when(local.date(), today), format_time(local.time())),
+                    completed=CompletedAction(type=Flow.RESCHEDULE,
+                                              booking_reference=appt.booking_reference,
+                                              appointment=appt))
+
+    def _execute_cancel(self, s: Session, now: datetime, today: date, tr: _Trace) -> _Out:
+        ctx = s.context
+        pa, snap = ctx.pending_action, ctx.appointment_snapshot
+        assert pa is not None and snap is not None
+        try:
+            appt = self._svc.cancel(appointment=snap, now=now)
+        except BookingError as err:
+            return self._write_failed(s, err, now, today, tr)
+        tr.add(K.DB_WRITE, executed=True, type=Flow.CANCEL.value,
+               booking_reference=appt.booking_reference, appointment_id=str(appt.id),
+               slot_id=str(appt.slot_id), version=appt.version)
+        ctx.pending_action = None
+        ctx.appointment_snapshot = appt
+        self._move(s, State.COMPLETED, tr, "action_executed")
+        return _Out(R.cancelled(appt.booking_reference),
+                    completed=CompletedAction(type=Flow.CANCEL,
+                                              booking_reference=appt.booking_reference,
+                                              appointment=appt))
+
+    def _write_failed(self, s: Session, err: BookingError, now: datetime, today: date,
+                      tr: _Trace) -> _Out:
+        """A reschedule/cancel write was refused. Nothing changed; recover safely."""
+        ctx, e = s.context, s.context.entities
+        pa = ctx.pending_action
+        flow, ref, code = pa.type, e.booking_reference or "", err.code
+        tr.add(K.DB_WRITE, executed=False, outcome=code, action_id=str(pa.action_id))
+        ctx.pending_action = None
+
+        if code in ("SLOT_TAKEN", "SLOT_UNAVAILABLE"):
+            self._move(s, State.COLLECTING, tr, code.lower())
+            status = "taken" if code == "SLOT_TAKEN" else "missing"
+            text = self._offer_alternatives(s, status, now, today, tr,
+                                            sentence=R.no_longer_available_move())
+            return _Out(text, error=code)
+
+        if code == "SAME_SLOT":
+            e.new_time, e.time_period, ctx.selected_slot_id = None, None, None
+            self._move(s, State.COLLECTING, tr, "same_slot")
+            return _Out(R.same_time(), error=code)
+
+        if code == "STALE_VERSION":
+            fresh = self._svc.verify_appointment(e.booking_reference, e.verify_name)
+            if fresh is not None and fresh.status == "confirmed" and fresh.starts_at > now:
+                ctx.appointment_snapshot = fresh
+                self._move(s, State.COLLECTING, tr, "appointment_changed")
+                return _Out(f"{R.appointment_changed()} {self._advance(s, now, today, tr)}",
+                            error=code)
+            if fresh is None:
+                code = "NOT_FOUND"
+            elif fresh.status == "cancelled":
+                code = "ALREADY_CANCELLED"
+            else:
+                code = "APPOINTMENT_PAST"
+
+        if code == "ALREADY_CANCELLED":
+            text = R.already_cancelled(ref) if flow == Flow.CANCEL else R.cannot_reschedule_cancelled(ref)
+        elif code == "APPOINTMENT_PAST":
+            text = R.appointment_past()
+        else:
+            text = R.appointment_not_found()
+        self._reset(s, tr, code.lower())
+        return _Out(text, error=code)
+
     # ---- slot filling
     def _collect(self, s: Session, p: ParsedTurn, now: datetime, today: date, tr: _Trace) -> _Out:
+        if p.intent == Intent.BOOK_APPOINTMENT and s.context.flow not in (None, Flow.BOOK):
+            self._enter_flow(s, Flow.BOOK, tr)
         ctx = s.context
         if p.intent == Intent.BOOK_APPOINTMENT and ctx.flow is None:
             ctx.flow = Flow.BOOK
-        if ctx.flow != Flow.BOOK:
+        if ctx.flow is None:
             tr.add(K.NO_ACTION, reason="no_active_request")
             return _Out(R.no_active_request())
 
@@ -255,18 +408,24 @@ class Engine:
             if slot is None:
                 tr.add(K.NO_ACTION, reason="invalid_option", option=p.option_index)
                 return _Out(R.option_invalid([o.label for o in ctx.offered_slots]))
-            changed = self._absorb_entities(s, Entities(time=self._svc.local_time(slot)), tr)
+            tkey = "new_time" if ctx.flow == Flow.RESCHEDULE else "time"
+            changed = self._absorb_entities(s, Entities(**{tkey: self._svc.local_time(slot)}), tr)
         else:
             if p.rule == "correction_marker_only":
                 tr.add(K.NO_ACTION, reason="correction_without_details")
                 return _Out(f"{R.what_to_change()} {self._prompt(s)}")
-            changed = self._absorb_entities(s, p.entities, tr)
-            for fld, code in p.errors.items():
-                notes.append(R.entity_error(fld, code))
-                hint = self._bump(ctx, fld) >= HINT_AFTER_RETRIES or hint
-            if p.doctor_unknown:
-                notes.append(R.unknown_doctor(p.doctor_unknown, self._doctor_names()))
-                hint = self._bump(ctx, "doctor") >= HINT_AFTER_RETRIES or hint
+            snap = ctx.appointment_snapshot
+            if (ctx.flow == Flow.RESCHEDULE and snap and p.entities.doctor_slug
+                    and p.entities.doctor_slug != snap.doctor_slug):
+                notes.append(R.same_doctor_only(snap.doctor_name))
+            changed = self._absorb_entities(s, self._relevant(ctx.flow, p.entities), tr)
+            if ctx.flow != Flow.CANCEL:
+                for fld, code in p.errors.items():
+                    notes.append(R.entity_error(fld, code))
+                    hint = self._bump(ctx, fld) >= HINT_AFTER_RETRIES or hint
+                if p.doctor_unknown and ctx.flow == Flow.BOOK:
+                    notes.append(R.unknown_doctor(p.doctor_unknown, self._doctor_names()))
+                    hint = self._bump(ctx, "doctor") >= HINT_AFTER_RETRIES or hint
         for f in changed:
             ctx.retries.pop("doctor" if f == "doctor_slug" else f, None)
 
@@ -275,10 +434,16 @@ class Engine:
             text += " " + R.type_instead()
         return _Out(text, error=next(iter(p.errors.values()), None))
 
+    @staticmethod
+    def _relevant(flow: Flow | None, inc: Entities) -> Entities:
+        keep = _ALLOWED.get(flow, set())
+        return Entities(**{k: v for k, v in inc.model_dump().items()
+                           if k in keep and v is not None})
+
     def _absorb_entities(self, s: Session, inc: Entities, tr: _Trace) -> list[str]:
         ctx, e = s.context, s.context.entities
         changed: list[str] = []
-        for f in ("doctor_slug", "date", "time", "time_period", "patient_name"):
+        for f in _ENTITY_FIELDS:
             new = getattr(inc, f)
             if new is None or getattr(e, f) == new:
                 continue
@@ -288,15 +453,20 @@ class Engine:
                 e.doctor_name = inc.doctor_name
             changed.append(f)
             tr.add(K.ENTITY_UPDATED, field=f, old=old, new=new)
-        if inc.time_period and inc.time is None and e.time is not None:
-            tr.add(K.ENTITY_UPDATED, field="time", old=e.time, new=None)
-            e.time = None
-            changed.append("time")
+        tkey = "new_time" if ctx.flow == Flow.RESCHEDULE else "time"
+        if inc.time_period and getattr(inc, tkey) is None and getattr(e, tkey) is not None:
+            tr.add(K.ENTITY_UPDATED, field=tkey, old=getattr(e, tkey), new=None)
+            setattr(e, tkey, None)
+            changed.append(tkey)
         if changed:
             if _SLOT_FIELDS & set(changed) or "time_period" in changed:
                 ctx.offered_slots = []
             if _SLOT_FIELDS & set(changed):
                 ctx.selected_slot_id = None
+            if _LOOKUP_FIELDS & set(changed):          # different reference/name: re-verify
+                ctx.appointment_snapshot = None
+                ctx.selected_slot_id = None
+                ctx.offered_slots = []
             if ctx.pending_action:
                 ctx.pending_action = None
                 tr.add(K.STALE_PENDING_CLEARED, reason="entity_changed", fields=changed)
@@ -304,10 +474,30 @@ class Engine:
 
     # ---- advance: decide what to ask / check / propose next
     def _advance(self, s: Session, now: datetime, today: date, tr: _Trace) -> str:
-        ctx, e = s.context, s.context.entities
+        ctx = s.context
         if ctx.pending_action:                      # nothing changed: re-read it
             return R.confirm_prompt(ctx.pending_action.summary)
         self._move(s, State.COLLECTING, tr, "collecting_details")
+        if ctx.flow in _APPT_FLOWS:
+            return self._advance_appointment(s, now, today, tr)
+        return self._advance_book(s, now, today, tr)
+
+    def _propose(self, s: Session, summary: str, now: datetime, tr: _Trace) -> str:
+        ctx = s.context
+        snap = ctx.appointment_snapshot
+        ctx.pending_action = PendingAction(
+            action_id=self._new_id(), type=ctx.flow, fingerprint=fingerprint(ctx),
+            slot_id=ctx.selected_slot_id,
+            appointment_id=snap.id if snap else None,
+            appointment_version=snap.version if snap else None,
+            summary=summary, created_at=now)
+        tr.add(K.CONFIRMATION_PROPOSED, executed=False,
+               action_id=str(ctx.pending_action.action_id), summary=summary)
+        self._move(s, State.AWAITING_CONFIRMATION, tr, "confirmation_proposed")
+        return R.confirm_prompt(summary)
+
+    def _advance_book(self, s: Session, now: datetime, today: date, tr: _Trace) -> str:
+        ctx, e = s.context, s.context.entities
         if not e.doctor_slug:
             return R.ask_doctor(self._doctor_names())
         if not e.date:
@@ -342,27 +532,106 @@ class Engine:
         t_label = format_time(e.time)
         if not e.patient_name:
             return R.slot_free_ask_name(e.doctor_name, when, t_label)
+        return self._propose(s, R.summary(e.doctor_name, when, t_label, e.patient_name), now, tr)
 
-        summary = R.summary(e.doctor_name, when, t_label, e.patient_name)
-        ctx.pending_action = PendingAction(
-            action_id=self._new_id(), type=Flow.BOOK, fingerprint=fingerprint(ctx),
-            slot_id=ctx.selected_slot_id, summary=summary, created_at=now)
-        tr.add(K.CONFIRMATION_PROPOSED, executed=False,
-               action_id=str(ctx.pending_action.action_id), summary=summary)
-        self._move(s, State.AWAITING_CONFIRMATION, tr, "confirmation_proposed")
-        return R.confirm_prompt(summary)
+    def _advance_appointment(self, s: Session, now: datetime, today: date, tr: _Trace) -> str:
+        ctx, e = s.context, s.context.entities
+        just_found = False
+        if ctx.appointment_snapshot is None:
+            if not e.booking_reference:
+                return R.ask_reference()
+            if not e.verify_name:
+                return R.ask_verify_name()
+            found = self._svc.verify_appointment(e.booking_reference, e.verify_name)
+            tr.add(K.APPOINTMENT_LOOKUP, verified=found is not None)
+            if found is None:                       # same text for unknown reference / wrong name
+                attempts = self._bump(ctx, "appointment_lookup")
+                e.booking_reference, e.verify_name = None, None
+                text = R.appointment_not_found()
+                return f"{text} {R.lookup_help()}" if attempts >= HINT_AFTER_RETRIES else text
+            ctx.retries.pop("appointment_lookup", None)
+            ctx.appointment_snapshot = found
+            just_found = True
+
+        snap = ctx.appointment_snapshot
+        ref = snap.booking_reference
+        local = snap.starts_at.astimezone(self._svc.tz)
+        cur_when, cur_t = R.when(local.date(), today), format_time(local.time())
+
+        if snap.status != "confirmed":
+            tr.add(K.REFUSED, executed=False, reason="already_cancelled", booking_reference=ref)
+            text = (R.already_cancelled(ref) if ctx.flow == Flow.CANCEL
+                    else R.cannot_reschedule_cancelled(ref))
+            self._reset(s, tr, "appointment_already_cancelled")
+            return text
+        if snap.starts_at <= now:
+            tr.add(K.REFUSED, executed=False, reason="appointment_past", booking_reference=ref)
+            self._reset(s, tr, "appointment_past")
+            return R.appointment_past()
+
+        if ctx.flow == Flow.CANCEL:
+            ctx.selected_slot_id = None
+            return self._propose(s, R.cancel_summary(ref, snap.doctor_name, cur_when, cur_t),
+                                 now, tr)
+
+        # ---- reschedule (same doctor only)
+        slug, dname = snap.doctor_slug, snap.doctor_name
+        if e.new_date is None:
+            return (R.found_ask_new_date(dname, cur_when, cur_t) if just_found
+                    else R.ask_new_date(dname))
+        when = R.when(e.new_date, today)
+
+        if e.new_time is None:
+            free = self._svc.free_slots(slug, e.new_date, now)
+            tr.add(K.AVAILABILITY_CHECK, doctor=slug, date=e.new_date, free_count=len(free))
+            if not free:
+                text = R.no_openings(dname, when)
+                e.new_date = None
+                ctx.offered_slots, ctx.selected_slot_id = [], None
+                return text
+            if e.time_period:
+                return self._offer_period(s, now, when, tr)
+            return R.ask_time()
+
+        chk = self._svc.check_slot(slug, e.new_date, e.new_time, now)
+        tr.add(K.AVAILABILITY_CHECK, doctor=slug, date=e.new_date, time=e.new_time,
+               result=chk.status)
+        if chk.status == "taken" and chk.slot.id == snap.slot_id:
+            tr.add(K.NO_ACTION, reason="same_slot")
+            e.new_time, e.time_period = None, None
+            ctx.selected_slot_id, ctx.offered_slots = None, []
+            return R.same_time()
+        if chk.status != "free":
+            return self._offer_alternatives(s, chk.status, now, today, tr)
+
+        ctx.selected_slot_id = chk.slot.id
+        ctx.offered_slots = []
+        summary = R.reschedule_summary(ref, dname, cur_when, cur_t, when, format_time(e.new_time))
+        return self._propose(s, summary, now, tr)
+
+    def _slot_target(self, ctx: Context):
+        """(doctor_slug, doctor_name, date_attr, time_attr) of the slot being chosen."""
+        e, snap = ctx.entities, ctx.appointment_snapshot
+        if ctx.flow == Flow.RESCHEDULE:
+            return (snap.doctor_slug, snap.doctor_name, "new_date", "new_time") if snap \
+                else (None, None, "new_date", "new_time")
+        return e.doctor_slug, e.doctor_name, "date", "time"
 
     def _offer_alternatives(self, s: Session, status: str, now: datetime, today: date,
                             tr: _Trace, sentence: str | None = None) -> str:
         ctx, e = s.context, s.context.entities
-        when = R.when(e.date, today)
-        lead = sentence or R.unavailable(status, e.doctor_name, when, format_time(e.time))
-        alts = self._svc.alternatives(e.doctor_slug, e.date, e.time, now, n=3)
-        e.time, e.time_period, ctx.selected_slot_id = None, None, None
+        slug, dname, dkey, tkey = self._slot_target(ctx)
+        d, t = getattr(e, dkey), getattr(e, tkey)
+        when = R.when(d, today)
+        lead = sentence or R.unavailable(status, dname, when, format_time(t))
+        alts = self._svc.alternatives(slug, d, t, now, n=3)
+        setattr(e, tkey, None)
+        e.time_period, ctx.selected_slot_id = None, None
         if not alts:
-            ctx.offered_slots, e.date = [], None
-            tr.add(K.ALTERNATIVES_OFFERED, count=0, doctor=e.doctor_slug)
-            return f"{lead} {R.no_other_openings(e.doctor_name, when)}"
+            ctx.offered_slots = []
+            setattr(e, dkey, None)
+            tr.add(K.ALTERNATIVES_OFFERED, count=0, doctor=slug)
+            return f"{lead} {R.no_other_openings(dname, when)}"
         self._set_offers(ctx, alts)
         labels = [o.label for o in ctx.offered_slots]
         tr.add(K.ALTERNATIVES_OFFERED, count=len(alts), slots=labels)
@@ -370,15 +639,16 @@ class Engine:
 
     def _offer_period(self, s: Session, now: datetime, when: str, tr: _Trace) -> str:
         ctx, e = s.context, s.context.entities
-        slots = self._svc.period_slots(e.doctor_slug, e.date, e.time_period, now, n=3)
+        slug, dname, dkey, _ = self._slot_target(ctx)
+        slots = self._svc.period_slots(slug, getattr(e, dkey), e.time_period, now, n=3)
         if not slots:
             period, e.time_period = e.time_period, None
             tr.add(K.ALTERNATIVES_OFFERED, count=0, period=period)
-            return R.no_period_openings(e.doctor_name, when, period)
+            return R.no_period_openings(dname, when, period)
         self._set_offers(ctx, slots)
         labels = [o.label for o in ctx.offered_slots]
         tr.add(K.ALTERNATIVES_OFFERED, count=len(slots), period=e.time_period, slots=labels)
-        return R.offer_period(e.doctor_name, when, e.time_period, labels)
+        return R.offer_period(dname, when, e.time_period, labels)
 
     # ---- small helpers
     def _set_offers(self, ctx: Context, slots) -> None:
@@ -409,23 +679,37 @@ class Engine:
         return [d.display_name for d in self._svc.doctors()]
 
     def _expected_field(self, s: Session) -> str | None:
-        if s.state != State.COLLECTING or s.context.flow != Flow.BOOK:
+        ctx = s.context
+        if s.state != State.COLLECTING or ctx.flow is None:
             return None
-        for attr, label in _BOOK_FIELDS:
-            if getattr(s.context.entities, attr) is None:
-                return label
+        if ctx.flow == Flow.BOOK:
+            for attr, label in _BOOK_FIELDS:
+                if getattr(ctx.entities, attr) is None:
+                    return label
+            return None
+        if ctx.appointment_snapshot is None:
+            for attr, label in _LOOKUP:
+                if getattr(ctx.entities, attr) is None:
+                    return label
+            return None
+        if ctx.flow == Flow.RESCHEDULE:
+            for attr, label in _MOVE_TARGET:
+                if getattr(ctx.entities, attr) is None:
+                    return label
         return None
 
     def _prompt(self, s: Session) -> str:
         """The question appropriate to the current state (no side effects)."""
         ctx, e = s.context, s.context.entities
         if s.state == State.DISAMBIGUATING:
-            return R.disambiguate()
+            return R.disambiguate(_ACTIVITY.get(ctx.flow, "booking"))
         if s.state == State.AWAITING_CONFIRMATION and ctx.pending_action:
             return R.confirm_prompt(ctx.pending_action.summary)
         if s.state == State.COLLECTING:
             if ctx.offered_slots:
                 return R.option_list([o.label for o in ctx.offered_slots])
+            if ctx.flow in _APPT_FLOWS:
+                return self._prompt_appointment(ctx)
             if not e.doctor_slug:
                 return R.ask_doctor(self._doctor_names())
             if not e.date:
@@ -437,10 +721,22 @@ class Engine:
             return R.what_to_change()
         return R.HELP
 
+    @staticmethod
+    def _prompt_appointment(ctx: Context) -> str:
+        e, snap = ctx.entities, ctx.appointment_snapshot
+        if snap is None:
+            return R.ask_verify_name() if e.booking_reference and not e.verify_name \
+                else R.ask_reference()
+        if ctx.flow == Flow.RESCHEDULE:
+            if e.new_date is None:
+                return R.ask_new_date(snap.doctor_name)
+            if e.new_time is None:
+                return R.ask_time()
+        return R.what_to_change()
+
     def _move(self, s: Session, new: State, tr: _Trace, reason: str) -> None:
-        if s.state != new:
-            tr.add(K.STATE_TRANSITION, from_state=s.state.value, to_state=new.value, reason=reason)
-            s.state = new
+        tr.add(K.STATE_TRANSITION, from_state=s.state.value, to_state=new.value, reason=reason)
+        s.state = new
 
     def _reset(self, s: Session, tr: _Trace, reason: str) -> None:
         s.context = Context(last_completed=s.context.last_completed)

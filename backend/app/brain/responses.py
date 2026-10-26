@@ -70,6 +70,42 @@ def slot_free_ask_name(doctor: str, when_str: str, t: str) -> str:
     return f"{doctor} has an opening {when_str} at {t}. {ask_name()}"
 
 
+# ---- existing-appointment lookup (reschedule / cancel)
+def ask_reference() -> str:
+    return "What's your booking reference? It starts with CL followed by six digits."
+
+
+def ask_verify_name() -> str:
+    return "And what name is the booking under?"
+
+
+def appointment_not_found() -> str:
+    # Deliberately identical for unknown reference and wrong name (no information leak).
+    return ("I couldn't find a matching appointment. Please check the details. "
+            "What's your booking reference?")
+
+
+def lookup_help() -> str:
+    return "You can also say 'start over', or contact the clinic if you can't find your reference."
+
+
+def found_ask_new_date(doctor: str, when_str: str, t: str) -> str:
+    return (f"I found your appointment with {doctor} {when_str} at {t}. "
+            "Which day would you like to move it to?")
+
+
+def ask_new_date(doctor: str) -> str:
+    return f"Which day would you like to move your appointment with {doctor} to?"
+
+
+def same_time() -> str:
+    return "That's already the time of your appointment. What other time would you like?"
+
+
+def same_doctor_only(doctor: str) -> str:
+    return f"I can only move your appointment within {doctor}'s schedule."
+
+
 # ---- availability
 def unavailable(status: str, doctor: str, when_str: str, asked: str) -> str:
     if status == "past":
@@ -81,6 +117,10 @@ def unavailable(status: str, doctor: str, when_str: str, asked: str) -> str:
 
 def no_longer_available() -> str:
     return "Sorry, that slot is no longer available, so nothing was saved."
+
+
+def no_longer_available_move() -> str:
+    return "Sorry, that slot is no longer available, so your appointment hasn't been changed."
 
 
 def openings(labels) -> str:
@@ -120,6 +160,16 @@ def summary(doctor: str, when_str: str, t: str, name: str) -> str:
     return f"book an appointment with {doctor} {when_str} at {t} under the name {name}"
 
 
+def reschedule_summary(ref: str, doctor: str, old_when: str, old_t: str,
+                       new_when: str, new_t: str) -> str:
+    return (f"move appointment {ref} with {doctor}, currently {old_when} at {old_t}, "
+            f"to {new_when} at {new_t}")
+
+
+def cancel_summary(ref: str, doctor: str, when_str: str, t: str) -> str:
+    return f"cancel appointment {ref} with {doctor} {when_str} at {t}"
+
+
 def confirm_prompt(summary_text: str) -> str:
     return f"Please confirm: {summary_text}? Say yes to confirm, or tell me what to change."
 
@@ -128,14 +178,49 @@ def booked(reference: str) -> str:
     return f"Your appointment has been booked successfully. Your booking reference is {reference}."
 
 
+def rescheduled(reference: str, doctor: str, when_str: str, t: str) -> str:
+    return f"Done. Appointment {reference} with {doctor} is now {when_str} at {t}."
+
+
+def cancelled(reference: str) -> str:
+    return f"Your appointment {reference} has been cancelled."
+
+
 def already_booked(reference: str) -> str:
     return (f"You've already booked that appointment. Your booking reference is {reference}. "
             "Is there anything else I can help with?")
 
 
+def already_cancelled(reference: str) -> str:
+    return (f"Appointment {reference} is already cancelled, so I haven't changed anything. "
+            "Is there anything else I can help with?")
+
+
+def cannot_reschedule_cancelled(reference: str) -> str:
+    return (f"Appointment {reference} has been cancelled, so it can't be rescheduled. "
+            "I can book a new appointment if you like.")
+
+
+def appointment_past() -> str:
+    return "That appointment is in the past, so I can't change it."
+
+
+def appointment_changed() -> str:
+    return "That appointment changed since I last checked, so I haven't made any change."
+
+
 def declined() -> str:
     return ("No problem, nothing has been booked. What would you like to change: "
             "the doctor, the day, the time, or the name?")
+
+
+def reschedule_declined() -> str:
+    return ("No problem, your appointment hasn't been changed. "
+            "What would you like to change: the day or the time?")
+
+
+def cancel_declined() -> str:
+    return "Okay, I haven't cancelled anything. Your appointment is unchanged."
 
 
 def what_to_change() -> str:
@@ -166,15 +251,14 @@ def expired() -> str:
     return "That confirmation expired, so I didn't save anything."
 
 
-def disambiguate() -> str:
-    return "Do you want to stop the booking you're working on, or cancel an existing appointment?"
+def disambiguate(activity: str = "booking") -> str:
+    return f"Do you want to stop the {activity} you're working on, or cancel an existing appointment?"
 
 
 # ---- input problems
 _ENTITY_ERRORS = {
     ("date", "INVALID_DATE"): "I couldn't read that date. Try something like 'tomorrow' or 'November 5th'.",
     ("date", "AMBIGUOUS_NUMERIC"): "I couldn't tell the day from the month in that date. Try something like 'November 5th'.",
-    ("date", "PAST_DATE"): "That date has already passed.",
     ("date", "BEYOND_HORIZON"): "I can only book up to two weeks ahead.",
     ("date", "CLOSED_SUNDAY"): "We're closed on Sundays.",
     ("time", "INVALID_TIME"): "I couldn't read that time.",

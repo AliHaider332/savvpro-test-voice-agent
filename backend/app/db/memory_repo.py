@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from app.brain.datetime_parse import is_slot_time
-from app.db.repository import Doctor, Slot, SlotNotFound, SlotTaken
+from app.db.repository import Doctor, Slot, SlotNotFound, SlotTaken, StaleAppointment
 from app.schemas import AppointmentSnapshot
 
 DOCTORS_SEED = [
@@ -30,7 +30,9 @@ class MemoryRepository:
         self._slots: dict[UUID, tuple[str, datetime]] = {}
         self._appts: dict[UUID, AppointmentSnapshot] = {}
         self._keys: dict[str, UUID] = {}
-        self.create_calls = 0     # every attempted mutation (tests assert on this)
+        self.create_calls = 0       # every attempted mutation (tests assert on this)
+        self.reschedule_calls = 0   # every attempted reschedule
+        self.cancel_calls = 0       # every attempted cancel
 
     # ---- seeding helpers (not part of the Repository protocol)
     def add_doctor(self, doctor: Doctor) -> None:
@@ -81,7 +83,45 @@ class MemoryRepository:
             raise SlotTaken()      # mirrors the partial unique index
         return self._insert(slot_id, patient_name, self._unique_reference(), idempotency_key)
 
+    def get_appointment_by_reference(self, reference: str) -> AppointmentSnapshot | None:
+        return next((a for a in self._appts.values()
+                     if a.booking_reference == reference), None)
+
+    def reschedule(self, *, appointment_id: UUID, expected_version: int,
+                   new_slot_id: UUID) -> AppointmentSnapshot:
+        self.reschedule_calls += 1
+        appt = self._require_current(appointment_id, expected_version)
+        if new_slot_id not in self._slots:
+            raise SlotNotFound()
+        if self._active_for_slot(new_slot_id):
+            raise SlotTaken()      # mirrors the partial unique index
+        slug, start = self._slots[new_slot_id]
+        updated = appt.model_copy(update={
+            "slot_id": new_slot_id, "doctor_slug": slug,
+            "doctor_name": self._doctors[slug].display_name,
+            "starts_at": start, "version": appt.version + 1})
+        self._appts[appt.id] = updated          # copy-on-write: old snapshots stay old
+        return updated
+
+    def cancel(self, *, appointment_id: UUID, expected_version: int) -> AppointmentSnapshot:
+        self.cancel_calls += 1
+        appt = self._require_current(appointment_id, expected_version)
+        updated = appt.model_copy(update={"status": "cancelled",
+                                          "version": appt.version + 1})
+        self._appts[appt.id] = updated
+        return updated
+
     # ---- internals
+    def _require_current(self, appointment_id: UUID, expected_version: int) -> AppointmentSnapshot:
+        appt = self._appts.get(appointment_id)
+        if appt is None:
+            raise StaleAppointment("not_found")
+        if appt.status != "confirmed":
+            raise StaleAppointment("cancelled")
+        if appt.version != expected_version:
+            raise StaleAppointment("version_changed")
+        return appt
+
     def _active_for_slot(self, slot_id: UUID) -> AppointmentSnapshot | None:
         for a in self._appts.values():
             if a.slot_id == slot_id and a.status == "confirmed":

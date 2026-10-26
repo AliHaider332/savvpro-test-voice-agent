@@ -47,6 +47,7 @@ class AppointmentSnapshot(BaseModel):
     doctor_name: str
     starts_at: datetime
     patient_name: str
+    cancelled_at: datetime | None = None
 
 
 class PendingAction(BaseModel):
@@ -138,3 +139,51 @@ class ErrorBody(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorBody
+
+
+# ---------- read-only API views ----------
+
+class DoctorOut(BaseModel):
+    slug: str
+    display_name: str
+    specialty: str
+
+
+class SlotOut(BaseModel):
+    starts_at: datetime                    # timezone-aware, clinic timezone
+    time: str                              # "14:30" (24h, clinic timezone)
+    label: str                             # "2:30 PM" or "9 AM"
+
+
+class AvailabilityResponse(BaseModel):
+    doctor_slug: str
+    doctor_name: str
+    date: Date
+    timezone: str
+    slots: list[SlotOut]                   # free, still-in-the-future slots only
+
+
+class AppointmentView(BaseModel):
+    """What a verified caller may see. Internal ids and the row version are not exposed."""
+    booking_reference: str
+    status: Literal["confirmed", "cancelled"]
+    doctor_slug: str
+    doctor_name: str
+    starts_at: datetime
+    patient_name: str
+    cancelled_at: datetime | None = None
+
+
+class ConversationView(BaseModel):
+    conversation_id: UUID
+    state: State
+    flow: Flow | None = None
+    turn_no: int
+    entities: Entities
+    pending_action: PendingActionView | None = None
+    last_response: TurnResponse | None = None   # lets a refreshed UI restore the last turn
+
+
+class HealthResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+    db: Literal["ok", "unavailable", "not_configured"]

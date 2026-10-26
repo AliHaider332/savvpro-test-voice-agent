@@ -233,10 +233,6 @@ def test_unsupported_and_medical_requests(say):
     assert "can't help with that" in r.assistant_text
 
 
-def test_reschedule_is_a_placeholder_until_task_5(say, repo):
-    r = say("Reschedule my appointment")
-    assert "isn't available in this build yet" in r.assistant_text
-    assert r.state == State.IDLE and repo.create_calls == 0
 
 
 def test_greeting(say):
